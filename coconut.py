@@ -7,6 +7,16 @@ from torch.nn import CrossEntropyLoss
 from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
+# Handle different transformers versions
+try:
+    from transformers.cache_utils import Cache, DynamicCache
+    HAS_CACHE_UTILS = True
+except ImportError:
+    # For older transformers versions
+    HAS_CACHE_UTILS = False
+    Cache = None
+    DynamicCache = None
+
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 MAX_N_LATENT = 8
 
@@ -79,14 +89,24 @@ class Coconut(nn.Module):
                 hidden_states_offset = 0
 
             else:
-                # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
+                # extract kv cache to reuse - handle both old tuple format and new Cache format
+                if isinstance(self.base_causallm, GPT2LMHeadModel):
+                    # For newer transformers versions with Cache objects
+                    # Create a new cache with truncated values
+                    past_key_values = [
+                        (
+                            k[:, :, : next_compute_range[0], :],
+                            v[:, :, : next_compute_range[0], :],
+                        )
+                        for k, v in kv_cache
+                    ]
+                else:
+                    # For older transformers versions with tuple format
+                    past_key_values = DynamicCache()
+                    for layer_idx in range(len(kv_cache.key_cache)):
+                        key = kv_cache.key_cache[layer_idx][:, :, : next_compute_range[0], :]
+                        value = kv_cache.value_cache[layer_idx][:, :, : next_compute_range[0], :]
+                        past_key_values.update(key, value, layer_idx)
 
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -157,24 +177,33 @@ class Coconut(nn.Module):
                 ]
             )
 
-        # final pass
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds[
-                :, next_compute_range[0] : next_compute_range[1], :
-            ],
-            attention_mask=attention_mask[:, : next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
+        # final pass - handle both Cache and tuple formats
+        if kv_cache is not None:
+            if isinstance(self.base_causallm, GPT2LMHeadModel):
+                # For newer transformers versions with Cache objects
+                past_key_values = [
                     (
                         k[:, :, : next_compute_range[0], :],
                         v[:, :, : next_compute_range[0], :],
                     )
                     for k, v in kv_cache
                 ]
-                if kv_cache
-                else None
-            ),
+            else:
+                past_key_values = DynamicCache()
+                for layer_idx in range(len(kv_cache.key_cache)):
+                    key = kv_cache.key_cache[layer_idx][:, :, : next_compute_range[0], :]
+                    value = kv_cache.value_cache[layer_idx][:, :, : next_compute_range[0], :]
+                    past_key_values.update(key, value, layer_idx)
+        else:
+            past_key_values = None
+
+        outputs = self.base_causallm(
+            inputs_embeds=inputs_embeds[
+                :, next_compute_range[0] : next_compute_range[1], :
+            ],
+            attention_mask=attention_mask[:, : next_compute_range[1]],
+            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
+            past_key_values=past_key_values,
             output_hidden_states=True,
         )
 

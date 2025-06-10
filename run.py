@@ -112,7 +112,7 @@ def main():
 
     loaded = False
 
-    if configs.load_model_path != "None":
+    if configs.load_model_path != None:
         saved_weights = torch.load(
             configs.load_model_path, map_location=torch.device(rank)
         )
@@ -163,7 +163,7 @@ def main():
     if configs.coconut:
         model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
-    if configs.load_model_path != "None" and not loaded:
+    if configs.load_model_path != None and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
@@ -217,7 +217,7 @@ def main():
 
     total_train_steps = 0
 
-    if not configs.debug and not configs.only_eval and rank == 0:
+    if configs.use_wandb and not configs.debug and not configs.only_eval and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
         text_table = wandb.Table(columns=["step", "text"])
