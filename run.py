@@ -13,8 +13,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 from coconut import Coconut
 from dataset import (
@@ -26,7 +24,6 @@ from dataset import (
 
 from tqdm import tqdm
 from copy import copy
-import itertools
 import os, sys
 import yaml
 import json
@@ -34,6 +31,33 @@ import gc
 import argparse
 import functools
 from utils import Config, set_seed
+
+
+def find_decoder_layer_class(model):
+    # 1. 모델 내부에서 레이어 리스트를 찾음
+    # (아래는 Huggingface 계열의 대표적 구조 예시)
+    candidates = [
+        getattr(model, "model", None),
+        getattr(model, "transformer", None),
+        model
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        # 가장 흔한 구조: layers, h, decoder.layers 등
+        for attr in ["layers", "h", "decoder", "block"]:
+            layers = getattr(candidate, attr, None)
+            if layers and isinstance(layers, (list, torch.nn.ModuleList)) and len(layers) > 0:
+                # 첫 번째 레이어의 타입 반환
+                return type(layers[0])
+            # decoder.layers 같이 중첩된 경우
+            if hasattr(candidate, "decoder"):
+                decoder = getattr(candidate, "decoder")
+                if hasattr(decoder, "layers"):
+                    layers = getattr(decoder, "layers")
+                    if layers and len(layers) > 0:
+                        return type(layers[0])
+    raise ValueError("Decoder layer class not found automatically.")
 
 
 def main():
@@ -169,12 +193,10 @@ def main():
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
 
+    layer_cls = find_decoder_layer_class(model)
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
-        },
+        transformer_layer_cls={layer_cls},
     )
 
     if configs.bf16:
