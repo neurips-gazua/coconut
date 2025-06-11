@@ -33,6 +33,11 @@ import functools
 from utils import Config, set_seed
 
 
+def is_main_process():
+    """Check if this is the main process"""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
 def find_decoder_layer_class(model):
     # 1. 모델 내부에서 레이어 리스트를 찾음
     # (아래는 Huggingface 계열의 대표적 구조 예시)
@@ -265,6 +270,8 @@ def main():
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
+    global_step = [0]
+
     for epoch in range(configs.resume, configs.num_epochs):
 
         scheduled_stage = (
@@ -385,17 +392,17 @@ def main():
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
 
+                if writer and step % 10 == 0 and is_main_process():
+                    writer.add_scalar('train/loss', loss.detach().float() * configs.gradient_accumulation_steps, global_step[0])
+                    writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step[0])
+                    global_step[0] += 1
+
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
                     optimizer.step()
                     optimizer.zero_grad()
                     pbar.update(1)
-
-                if writer and rank == 0:
-                    writer.add_scalar('train/epoch', epoch + 1, total_train_steps)
-                    writer.add_scalar('train/step', epoch * len(train_dataloader) + step, total_train_steps)
-                    writer.add_scalar('train/loss', loss.detach().float() * configs.gradient_accumulation_steps, total_train_steps)
 
                 pbar.set_description(
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
