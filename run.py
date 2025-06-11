@@ -6,7 +6,7 @@ import torch.distributed
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -57,7 +57,7 @@ def find_decoder_layer_class(model):
                     layers = getattr(decoder, "layers")
                     if layers and len(layers) > 0:
                         return type(layers[0])
-    raise ValueError("Decoder layer class not found automatically.")
+    return None
 
 
 def main():
@@ -194,10 +194,14 @@ def main():
     model = model.to(rank)
 
     layer_cls = find_decoder_layer_class(model)
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={layer_cls},
-    )
+
+    if layer_cls is None:
+        auto_wrap_policy = None
+    else:
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={layer_cls},
+        )
 
     if configs.bf16:
         model.to(torch.bfloat16)
@@ -208,7 +212,7 @@ def main():
 
     else:
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model, auto_wrap_policy=auto_wrap_policy, device_id=rank
         )
 
     del model
@@ -239,13 +243,13 @@ def main():
 
     total_train_steps = 0
 
-    if configs.use_wandb and not configs.debug and not configs.only_eval and rank == 0:
-        wandb_run = wandb.init(project=configs.project, name=configs.name)
-        wandb_run.config.update(configs, allow_val_change=True)
-        text_table = wandb.Table(columns=["step", "text"])
-
+    if not configs.debug and not configs.only_eval and rank == 0:
+        log_dir = os.path.join(save_dir, 'logs')
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        writer = SummaryWriter(log_dir=log_dir)
     else:
-        wandb_run = None
+        writer = None
 
     if configs.reset_optimizer:
         optimizer = None
@@ -352,7 +356,7 @@ def main():
 
             for step, batch in enumerate(train_dataloader):
 
-                if step == 0 and wandb_run and rank == 0:
+                if step == 0 and writer and rank == 0:
                     print("logging training data")
                     cur_bs = len(batch["input_ids"])
                     text_str = ""
@@ -369,11 +373,7 @@ def main():
                                 + "\n"
                             )
                         text_str += "====" * 10 + "\n"
-                    text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
-
-                    wandb_run.log({"data_table": copy(text_table)})
+                    writer.add_text('training_data', text_str, total_train_steps)
 
                 total_train_steps += 1
                 batch = {
@@ -392,14 +392,10 @@ def main():
                     optimizer.zero_grad()
                     pbar.update(1)
 
-                if wandb_run and rank == 0:
-                    log_dict = {
-                        "train/epoch": epoch + 1,
-                        "train/step": epoch * len(train_dataloader) + step,
-                        "train/loss": loss.detach().float()
-                        * configs.gradient_accumulation_steps,
-                    }
-                    wandb_run.log(log_dict)
+                if writer and rank == 0:
+                    writer.add_scalar('train/epoch', epoch + 1, total_train_steps)
+                    writer.add_scalar('train/step', epoch * len(train_dataloader) + step, total_train_steps)
+                    writer.add_scalar('train/loss', loss.detach().float() * configs.gradient_accumulation_steps, total_train_steps)
 
                 pbar.set_description(
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
@@ -441,12 +437,8 @@ def main():
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     total_loss += loss.item() / world_size
 
-                if wandb_run and rank == 0:
-
-                    log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
-                    }
-                    wandb_run.log(log_dict)
+                if writer and rank == 0:
+                    writer.add_scalar('eval/loss', total_loss / len(valid_loss_dataloader), total_train_steps)
                     print("eval loss", total_loss / len(valid_loss_dataloader))
 
         # val generation accuracy
@@ -524,10 +516,13 @@ def main():
             print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
         sys.stdout.flush()
 
-        if wandb_run:
-            wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+        if writer and rank == 0:
+            writer.add_scalar('eval/acc', cor / total, total_train_steps)
+            writer.add_scalar('eval/cot_em', cor_cot / total, total_train_steps)
 
         if configs.only_eval:
+            if writer:
+                writer.close()
             break
 
         dist.barrier()
