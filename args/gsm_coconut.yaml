@@ -1,12 +1,13 @@
 # need 4 gpus
 
 project: coconut
-save_path: YOUR_PATH_TO_SAVE_THE_MODEL
+save_path: output
 name: gsm-coconut
 
 only_eval: False
 
 coconut: True
+coconut_embds: False
 cot: False
 no_thoughts: False
 no_cot: False

@@ -4,14 +4,77 @@
 import json
 import itertools
 import random
+import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+
+def get_dataset_with_embeddings(path, tokenizer, max_size=1000000000):
+
+    def tokenize_sample(sample):
+        question_tokenized = tokenizer.encode(
+            sample["question"] + "\n", add_special_tokens=True
+        )
+        steps_tokenized = [
+            tokenizer.encode(s + "\n", add_special_tokens=False)
+            for s in sample["steps"]
+        ]
+        answer_tokenized = tokenizer.encode(
+            "### " + sample["answer"], add_special_tokens=False
+        ) + [tokenizer.eos_token_id]
+
+        processed_sample = {
+            "question_tokenized": question_tokenized,
+            "steps_tokenized": steps_tokenized,
+            "answer_tokenized": answer_tokenized,
+            "idx": sample["idx"],
+            "steps_emb": sample["steps_emb"] if "steps_emb" in sample else None
+        }
+
+        return processed_sample
+
+    if path.endswith('.jsonl') or 'arrow' in path:
+        try:
+            dataset = load_from_disk(path)
+            if 'idx' not in dataset.features:
+                dataset = dataset.add_column('idx', list(range(len(dataset))))
+            
+            if max_size < len(dataset):
+                dataset = dataset.select(range(max_size))
+        except Exception as e:
+            print(f"Arrow 파일 로드 실패, JSON으로 시도: {e}")
+
+    else:
+        # for valid dataset
+        data = json.load(open(path))[:max_size]
+        data = [{**d, "idx": idx} for idx, d in enumerate(data)]
+        keys = data[0].keys()
+        dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
+
+    if torch.cuda.device_count() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = [dataset.map(
+                tokenize_sample,
+                remove_columns=list(dataset.features),
+                num_proc=32
+            )]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        dataset = processed_dataset[0]
+    else:
+        dataset = dataset.map(
+            tokenize_sample,
+            remove_columns=list(dataset.features),
+            num_proc=32
+        )
+        
+    return dataset
 
 
 def get_dataset(path, tokenizer, max_size=1000000000):
@@ -82,6 +145,8 @@ class MyCollator:
     tokenizer: PreTrainedTokenizerBase
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
+    max_embedding_steps: int = 8
+    embedding_dim: int = 768  # 설정 가능하도록 수정
 
     def __call__(self, features, return_tensors=None):
 
@@ -130,11 +195,13 @@ class MyCollator:
 
         label_name = "label" if "label" in features[0].keys() else "labels"
 
+        has_embeddings = "steps_emb" in features[0] and features[0]["steps_emb"] is not None
+
         non_label_position_features = [
             {
                 k: v
                 for k, v in feature.items()
-                if k != label_name and k != "position_ids"
+                if k not in [label_name, "position_ids", "steps_emb"]
             }
             for feature in features
         ]
@@ -182,6 +249,29 @@ class MyCollator:
                 batch["position_ids"], dtype=torch.int64
             )
 
+        if has_embeddings:
+            embeddings_list = []
+            for feature in features:
+                emb = feature["steps_emb"]
+                if emb is not None and len(emb) > 0:
+                    if isinstance(emb, (list, np.ndarray)):
+                        emb = torch.tensor(emb, dtype=torch.float32)
+                    
+                    # 크기 조정 (자르기 또는 패딩) (batch_size, 8, 1024)
+                    if len(emb) > self.max_embedding_steps:
+                        emb = emb[:self.max_embedding_steps]
+                    elif len(emb) < self.max_embedding_steps:
+                        padding_size = self.max_embedding_steps - len(emb)
+                        emb_dim = emb.shape[-1]
+                        padding = torch.zeros(padding_size, emb_dim, dtype=torch.float32)
+                        emb = torch.cat([emb, padding], dim=0)
+                    
+                    embeddings_list.append(emb)
+                else:
+                    # 임베딩이 없는 경우 제로 텐서
+                    zero_emb = torch.zeros(self.max_embedding_steps, self.embedding_dim, dtype=torch.float32)
+                    embeddings_list.append(zero_emb)
+            batch["target_embeddings"] = torch.stack(embeddings_list)
         return batch
 
 
@@ -283,7 +373,7 @@ def get_cot_latent_dataset(
             + sample["answer_tokenized"]
         )
 
-        return {
+        processed = {
             "input_ids": tokens,
             "labels": [-100]
             * (
@@ -300,6 +390,12 @@ def get_cot_latent_dataset(
             "idx": sample["idx"],
             "position_ids": list(range(len(tokens))),
         }
+        
+        # coconut_embeds 사용 시 임베딩 추가
+        if 'steps_emb' in sample and sample['steps_emb'] is not None:
+            processed['steps_emb'] = sample['steps_emb']
+            
+        return processed
 
     if torch.cuda.device_count() > 1:
         if dist.get_rank() == 0:

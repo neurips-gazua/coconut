@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn as nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, MSELoss
 from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
@@ -17,12 +17,332 @@ except ImportError:
     Cache = None
     DynamicCache = None
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits", "embedding_loss"])
 MAX_N_LATENT = 8
 
 
-class Coconut(nn.Module):
+class CoconutEmbds(nn.Module):
 
+    def __init__(
+        self,
+        base_causallm,
+        latent_token_id,
+        start_latent_id,
+        end_latent_id,
+        eos_token_id,
+        tokenizer=None,
+        embedding_loss_weight=0.1, #embedding loss weight
+        
+    ):
+
+        super(CoconutEmbds, self).__init__()
+        self.gen_forward_cnt = 0
+        self.base_causallm = base_causallm
+        self.latent_token_id = latent_token_id
+        self.eos_token_id = eos_token_id
+        self.start_latent_id = start_latent_id
+        self.end_latent_id = end_latent_id
+        self.embedding_loss_weight = embedding_loss_weight
+        self.tokenizer = tokenizer # for debugging
+
+        # tested with GPT2 and Llama3
+        if isinstance(self.base_causallm, GPT2LMHeadModel):
+            self.embedding = self.base_causallm.transformer.get_input_embeddings()
+            self.hidden_size = self.base_causallm.config.hidden_size
+        else:
+            self.embedding = self.base_causallm.get_input_embeddings()
+            self.hidden_size = self.base_causallm.config.hidden_size
+            
+        self.target_projection = nn.Linear(1024, self.hidden_size)
+
+    def forward(self, input_ids, attention_mask, labels, position_ids, target_embeddings=None, **kwargs):
+
+        logits = []
+        collected_latent_embeddings = []
+        latent_indices = (
+            input_ids == self.latent_token_id
+        ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
+
+        latent_lists = [
+            [idx[1].item() for idx in latent_indices if idx[0] == i]
+            for i in range(input_ids.shape[0])
+        ]  # bs, num_latent_tokens_in_the_instance (difference across the batch)
+
+        max_n_latents = max([len(l) for l in latent_lists])
+        next_compute_range = (0, input_ids.shape[1])
+        inputs_embeds = self.embedding(input_ids)
+
+        if max_n_latents > 0:
+            next_compute_range = (0, latent_indices[:, 1].min().item())
+            # before the earliest latent token position
+
+        kv_cache = None
+
+        for pass_idx in range(max_n_latents):
+
+            if kv_cache == None:
+                # first forward pass
+                outputs = self.base_causallm(
+                    inputs_embeds=inputs_embeds[
+                        :, next_compute_range[0] : next_compute_range[1], :
+                    ],
+                    attention_mask=attention_mask[
+                        :, next_compute_range[0] : next_compute_range[1]
+                    ],
+                    position_ids=position_ids[
+                        :, next_compute_range[0] : next_compute_range[1]
+                    ],
+                    output_hidden_states=True,
+                )
+                hidden_states_offset = 0
+
+            else:
+                # extract kv cache to reuse - handle both old tuple format and new Cache format
+                if isinstance(self.base_causallm, GPT2LMHeadModel):
+                    # For newer transformers versions with Cache objects
+                    # Create a new cache with truncated values
+                    past_key_values = [
+                        (
+                            k[:, :, : next_compute_range[0], :],
+                            v[:, :, : next_compute_range[0], :],
+                        )
+                        for k, v in kv_cache
+                    ]
+                else:
+                    # For older transformers versions with tuple format
+                    past_key_values = DynamicCache()
+                    for layer_idx in range(len(kv_cache.key_cache)):
+                        key = kv_cache.key_cache[layer_idx][:, :, : next_compute_range[0], :]
+                        value = kv_cache.value_cache[layer_idx][:, :, : next_compute_range[0], :]
+                        past_key_values.update(key, value, layer_idx)
+
+                outputs = self.base_causallm(
+                    inputs_embeds=inputs_embeds[
+                        :, next_compute_range[0] : next_compute_range[1], :
+                    ],
+                    attention_mask=attention_mask[:, : next_compute_range[1]],
+                    position_ids=position_ids[
+                        :, next_compute_range[0] : next_compute_range[1]
+                    ],
+                    past_key_values=past_key_values,
+                    output_hidden_states=True,
+                )
+
+                hidden_states_offset = next_compute_range[0]
+                # when we use kv_cache for the first k tokens
+                # in `outputs.hidden_states`, [0, k) will be skipped
+                # so we need to keep this offset to correctly use the last hidden states
+
+            logits.append(outputs.logits)
+
+            next_compute_range = (
+                next_compute_range[1],
+                (
+                    input_ids.shape[1]
+                    if pass_idx + 1 >= max_n_latents
+                    else next_compute_range[1] + 1
+                ),
+            )
+
+            hidden_states = outputs.hidden_states[
+                -1
+            ]  # Get the last layer hidden states
+            kv_cache = outputs.past_key_values
+
+            # feedback the continuous thoughts to the input_embeds
+
+            # first decide the positions to feedback
+            filling_indices = [
+                (instance_idx, mask_list[pass_idx])
+                for instance_idx, mask_list in enumerate(latent_lists)
+                if len(mask_list) > pass_idx
+            ]
+            
+            # 단계별로 latent embedding 수집
+            step_latent_embeddings = []
+            for idx_pair in filling_indices:
+                batch_idx, token_idx = idx_pair
+                latent_emb = hidden_states[batch_idx, token_idx - 1 - hidden_states_offset, :]
+                step_latent_embeddings.append((batch_idx, latent_emb))
+                
+            collected_latent_embeddings.append(step_latent_embeddings)
+            # to avoid in-place operations
+            # break down inputs_embeds (bs, len, hidden_size) into a list of list of 1-d tensors
+            tensor_list = [
+                [
+                    inputs_embeds[batch_idx, pos, :]
+                    for pos in range(inputs_embeds.shape[1])
+                ]
+                for batch_idx in range(inputs_embeds.shape[0])
+            ]
+
+            # replace some of them with continuous thoughts
+            for idx_pair in filling_indices:
+                batch_idx, token_idx = idx_pair
+
+                # replace it with the preceding last hidden states
+                tensor_list[batch_idx][token_idx] = hidden_states[
+                    batch_idx, token_idx - 1 - hidden_states_offset, :
+                ]
+
+            # assemble the new inputs_embeds
+            inputs_embeds = torch.stack(
+                [
+                    torch.stack(tensor_list[batch_idx])
+                    for batch_idx in range(inputs_embeds.shape[0])
+                ]
+            )
+
+        # final pass - handle both Cache and tuple formats
+        if kv_cache is not None:
+            if isinstance(self.base_causallm, GPT2LMHeadModel):
+                # For newer transformers versions with Cache objects
+                past_key_values = [
+                    (
+                        k[:, :, : next_compute_range[0], :],
+                        v[:, :, : next_compute_range[0], :],
+                    )
+                    for k, v in kv_cache
+                ]
+            else:
+                past_key_values = DynamicCache()
+                for layer_idx in range(len(kv_cache.key_cache)):
+                    key = kv_cache.key_cache[layer_idx][:, :, : next_compute_range[0], :]
+                    value = kv_cache.value_cache[layer_idx][:, :, : next_compute_range[0], :]
+                    past_key_values.update(key, value, layer_idx)
+        else:
+            past_key_values = None
+
+        outputs = self.base_causallm(
+            inputs_embeds=inputs_embeds[
+                :, next_compute_range[0] : next_compute_range[1], :
+            ],
+            attention_mask=attention_mask[:, : next_compute_range[1]],
+            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
+            past_key_values=past_key_values,
+            output_hidden_states=True,
+        )
+
+        logits.append(outputs.logits)
+
+        self.gen_forward_cnt += max_n_latents + 1
+
+        logits = torch.cat(logits, dim=-2)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = CrossEntropyLoss()
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        
+        # embedding loss
+        embedding_loss = torch.tensor(0.0, device=loss.device)
+        if target_embeddings is not None and len(collected_latent_embeddings) > 0:
+            embedding_loss = self._compute_embedding_loss(
+                collected_latent_embeddings, target_embeddings
+            )
+        total_loss = loss + self.embedding_loss_weight * embedding_loss ### 요 부분
+        
+        return Outputs(loss=total_loss, 
+                       inputs_embeds=inputs_embeds, 
+                       logits=logits,
+                       embedding_loss=embedding_loss)
+
+    def _compute_embedding_loss(self, collected_latent_embeddings, target_embeddings):
+        mse_loss_fct = MSELoss()
+        
+        total_loss = torch.tensor(0.0, device=collected_latent_embeddings[0][0][1].device)
+        num_pairs = 0
+        
+        for step_idx, step_embeddings in enumerate(collected_latent_embeddings):
+            for batch_idx, latent_emb in step_embeddings:
+                if step_idx < target_embeddings.shape[1]:
+                    target_emb = target_embeddings[batch_idx, step_idx, :]
+                    
+                    if torch.any(target_emb != 0):
+                        projected_target_emb = self.target_projection(target_emb)
+                        projected_target_emb = projected_target_emb.to(latent_emb.device)
+                        
+                    latent_emb_norm = torch.nn.functional.normalize(latent_emb, p=2, dim=0)
+                    target_emb_norm = torch.nn.functional.normalize(projected_target_emb, p=2, dim=0)
+                    
+                    loss = mse_loss_fct(latent_emb_norm, target_emb_norm)
+                    total_loss += loss
+                    num_pairs += 1
+                    
+        return total_loss / max(num_pairs, 1) # 평균 loss
+
+    def train(self):
+        self.base_causallm.train()
+
+    def eval(self):
+        self.base_causallm.eval()
+
+    def generate(
+        self,
+        input_ids,
+        attention_mask,  # attention_mask is not used
+        max_new_tokens=16,
+        output_embedding=False,
+        synced_gpus=False,
+        **kwargs
+    ):
+
+        self.gen_forward_cnt = 0
+
+        assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
+
+        tokens = input_ids[0].detach().tolist()
+
+        labels = input_ids.clone()  # placeholder. not used.
+        outputs = self.forward(
+            input_ids,
+            torch.ones_like(input_ids, device=input_ids.device),
+            labels,
+            torch.arange(
+                0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
+            ).reshape(1, -1),
+        )
+        inputs_embeds = outputs.inputs_embeds
+
+        # get the first token using the current hidden state
+        next_token = torch.argmax(outputs.logits[0, -1]).item()
+        tokens.append(next_token)
+        new_token_embed = self.embedding(
+            torch.tensor(next_token, device=input_ids.device)
+        ).view(1, 1, -1)
+        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
+
+        # get other tokens
+        for _ in range(max_new_tokens - 1):
+            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
+            self.gen_forward_cnt += 1
+            next_token = torch.argmax(outputs.logits[0, -1]).item()
+            if next_token == self.eos_token_id:
+                break
+            tokens.append(next_token)
+            new_token_embed = self.embedding(
+                torch.tensor(next_token, device=input_ids.device)
+            ).view(1, 1, -1)
+            new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
+
+        if synced_gpus:
+            # in FSDP, the number of forward pass need to be the same across devices
+            while (
+                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
+            ):  # leave some room for latent tokens
+                self.gen_forward_cnt += 1
+                _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
+
+        if output_embedding:
+            # for analysis purpose
+            return torch.tensor(tokens).view(1, -1), new_inputs_embeds
+
+        else:
+            return torch.tensor(tokens).view(1, -1)
+        
+class Coconut(nn.Module):
+    
     def __init__(
         self,
         base_causallm,
@@ -219,7 +539,10 @@ class Coconut(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        return Outputs(loss=loss, 
+                      inputs_embeds=inputs_embeds, 
+                      logits=logits,
+                      embedding_loss=torch.tensor(0.0, device=loss.device))
 
     def train(self):
         self.base_causallm.train()
@@ -289,3 +612,4 @@ class Coconut(nn.Module):
 
         else:
             return torch.tensor(tokens).view(1, -1)
+        

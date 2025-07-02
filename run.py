@@ -14,12 +14,13 @@ import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from coconut import Coconut
+from coconut import Coconut, CoconutEmbds
 from dataset import (
     get_dataset,
     get_question_latent_dataset,
     get_cot_latent_dataset,
     MyCollator,
+    get_dataset_with_embeddings
 )
 
 from tqdm import tqdm
@@ -189,9 +190,11 @@ def main():
         configs.c_thought = 0
         configs.coconut = False
 
-    if configs.coconut:
+    if configs.coconut_embds:
+        model = CoconutEmbds(model, latent_id, start_id, end_id, tokenizer.eos_token_id, tokenizer=tokenizer, embedding_loss_weight=configs.embedding_loss_weight)
+    elif configs.coconut:
         model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
-
+        
     if configs.load_model_path != None and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
@@ -231,15 +234,14 @@ def main():
         d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
     ]
     cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+    
+    if configs.coconut_embds:
+        base_dataset_train = get_dataset_with_embeddings(configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000)
+        base_dataset_valid = get_dataset_with_embeddings(configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000)
+    else:
+        base_dataset_train = get_dataset(configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000)
+        base_dataset_valid = get_dataset(configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000)
 
-    base_dataset_valid = get_dataset(
-        configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
-    )
-
-    if not configs.only_eval:
-        base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000
-        )
 
     if "gsm" in configs.val_path:
         max_new_tokens = 64
@@ -395,6 +397,11 @@ def main():
                 if writer and step % 10 == 0 and is_main_process():
                     writer.add_scalar('train/loss', loss.detach().float() * configs.gradient_accumulation_steps, global_step[0])
                     writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], global_step[0])
+                    
+                    # embedding loss 추가
+                    if hasattr(outputs, 'embedding_loss'):
+                        writer.add_scalar('train/embedding_loss', outputs.embedding_loss.detach().float(), global_step[0])
+                    
                     global_step[0] += 1
 
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
@@ -430,6 +437,7 @@ def main():
 
             # val loss
             total_loss = 0
+            total_embedding_loss = 0
 
             with torch.no_grad():
                 parallel_model.module.eval()
@@ -441,11 +449,24 @@ def main():
 
                     outputs = parallel_model(**batch)
                     loss = outputs.loss
+                    
+                    # embedding loss 누적
+                    if hasattr(outputs, 'embedding_loss'):
+                        embedding_loss = outputs.embedding_loss
+                        dist.all_reduce(embedding_loss, op=dist.ReduceOp.SUM)
+                        total_embedding_loss += embedding_loss.item() / world_size
+                    
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     total_loss += loss.item() / world_size
 
                 if writer and rank == 0:
                     writer.add_scalar('eval/loss', total_loss / len(valid_loss_dataloader), total_train_steps)
+                    
+                    # embedding loss 추가
+                    if hasattr(outputs, 'embedding_loss'):
+                        avg_embedding_loss = total_embedding_loss / len(valid_loss_dataloader)
+                        writer.add_scalar('eval/embedding_loss', avg_embedding_loss, total_train_steps)
+                    
                     print("eval loss", total_loss / len(valid_loss_dataloader))
 
         # val generation accuracy

@@ -8,6 +8,7 @@ only_eval: True
 
 coconut: True
 cot: False
+coconut_embds: False
 no_thoughts: False
 no_cot: False
 
